@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: tripplanner
+      POSTGRES_PASSWORD: tripplanner
+      POSTGRES_DB: tripplanner
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume: data survives `docker compose down` and container recreation.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tripplanner -d tripplanner"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    depends_on:
+      postgres:
+        # Wait until Postgres actually accepts connections, not just until it starts.
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      CORS_ORIGIN: http://localhost:5173
+      # "postgres" is the compose service name, resolved by Docker's internal DNS.
+      # localhost inside this container would mean the backend container itself.
+      DATABASE_URL: postgresql://tripplanner:tripplanner@postgres:5432/tripplanner
+    ports:
+      - "3000:3000"
+    volumes:
+      # Bind-mount source for hot reload...
+      - ./backend:/app
+      # ...but keep the container's own node_modules (built for Linux) from being
+      # shadowed by the host's.
+      - /app/node_modules
+
+volumes:
+  postgres-data:
