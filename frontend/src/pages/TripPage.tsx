@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { APIProvider } from '@vis.gl/react-google-maps'
+import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 import {
@@ -10,6 +11,12 @@ import {
   type Stop,
   type TripDetail,
 } from '../api'
+import PlaceAutocomplete, { type SelectedPlace } from '../components/PlaceAutocomplete'
+import TripMap from '../components/TripMap'
+
+// Used in the browser by design — a Maps JS key is public and is secured with HTTP
+// referrer + API restrictions in the Cloud console, not by hiding it behind the backend.
+const MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined
 
 export default function TripPage() {
   const { id } = useParams<{ id: string }>()
@@ -17,10 +24,8 @@ export default function TripPage() {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [newStopName, setNewStopName] = useState('')
+  const [mapsError, setMapsError] = useState<string | null>(null)
 
-  // useCallback keeps this the same function between renders, so the effect below
-  // doesn't re-run on every render.
   const refresh = useCallback(async () => {
     if (!id) return
     setData(await getTrip(id))
@@ -34,28 +39,31 @@ export default function TripPage() {
   }, [refresh])
 
   /** Every mutation: run it, re-fetch so the order is the server's, surface failures. */
-  async function run(action: () => Promise<unknown>) {
-    setBusy(true)
-    setError(null)
-    try {
-      await action()
-      await refresh()
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
-  }
+  const run = useCallback(
+    async (action: () => Promise<unknown>) => {
+      setBusy(true)
+      setError(null)
+      try {
+        await action()
+        await refresh()
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setBusy(false)
+      }
+    },
+    [refresh],
+  )
 
-  function handleAddStop(event: FormEvent) {
-    event.preventDefault()
-    const trimmed = newStopName.trim()
-    if (!trimmed || !id) return
-    void run(async () => {
-      await addStop(id, trimmed)
-      setNewStopName('')
-    })
-  }
+  // Handed straight to the add-stop endpoint: the Places fields were already mapped to
+  // name/address/placeId/lat/lng by the autocomplete wrapper.
+  const handleSelectPlace = useCallback(
+    (place: SelectedPlace) => {
+      if (!id) return
+      void run(() => addStop(id, place))
+    },
+    [id, run],
+  )
 
   function handleRename(stopId: string, current: string) {
     const next = window.prompt('Rename stop', current)
@@ -103,13 +111,37 @@ export default function TripPage() {
 
       {error && <p role="alert">Something went wrong — {error}</p>}
 
+      {/* One APIProvider for the whole page: the map and the place search share this
+          single script load and single API key. A second loader would trigger Google's
+          "included multiple times" warning. */}
+      {MAPS_API_KEY ? (
+        <APIProvider
+          apiKey={MAPS_API_KEY}
+          onError={() =>
+            setMapsError('Google Maps failed to load. Check the API key and its restrictions.')
+          }
+        >
+          {mapsError ? <p role="alert">{mapsError}</p> : <TripMap stops={stops} />}
+
+          <h2>Add a stop</h2>
+          <PlaceAutocomplete onSelect={handleSelectPlace} disabled={busy} />
+        </APIProvider>
+      ) : (
+        <p role="alert">
+          VITE_GOOGLE_MAPS_API_KEY is not set, so the map and place search are unavailable.
+          See the README for Cloud console setup.
+        </p>
+      )}
+
+      <h2>Stops</h2>
       {stops.length === 0 ? (
-        <p>No stops yet.</p>
+        <p>No stops yet. Search for a place above.</p>
       ) : (
         <ol>
           {stops.map((stop, index) => (
             <li key={stop.id}>
-              {stop.name}{' '}
+              {stop.name}
+              {stop.address && <span> — {stop.address}</span>}{' '}
               <button onClick={() => handleMoveUp(stops, index)} disabled={busy || index === 0}>
                 ↑
               </button>
@@ -129,18 +161,6 @@ export default function TripPage() {
           ))}
         </ol>
       )}
-
-      <form onSubmit={handleAddStop}>
-        <input
-          value={newStopName}
-          onChange={(e) => setNewStopName(e.target.value)}
-          placeholder="Add a stop"
-          disabled={busy}
-        />
-        <button type="submit" disabled={busy || newStopName.trim() === ''}>
-          Add stop
-        </button>
-      </form>
 
       <p>
         <Link to="/">← Start a new trip</Link>

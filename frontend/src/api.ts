@@ -47,10 +47,19 @@ export const createTrip = (name: string) =>
 
 export const getTrip = (tripId: string) => request<TripDetail>(`/api/trips/${tripId}`);
 
-export const addStop = (tripId: string, name: string) =>
+/** What the Places selection gives us, and exactly what the add-stop endpoint wants. */
+export type NewStopInput = {
+  name: string;
+  address: string | null;
+  placeId: string;
+  lat: number;
+  lng: number;
+};
+
+export const addStop = (tripId: string, stop: NewStopInput) =>
   request<Stop>(`/api/trips/${tripId}/stops`, {
     method: "POST",
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(stop),
   });
 
 export const renameStop = (stopId: string, name: string) =>

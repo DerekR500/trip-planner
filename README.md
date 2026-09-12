@@ -1,10 +1,10 @@
 # Trip Planner
 
-A collaborative trip planner. Currently at **Milestone 2**: a persistent, single-user trip
-with ordered stops over plain HTTP.
+A collaborative trip planner. Currently at **Milestone 3**: a persistent, single-user trip
+whose stops are real, geocoded places shown on a Google map.
 
 ```
-frontend/   Vite + React + TypeScript + React Router (runs on your machine)
+frontend/   Vite + React + TS + React Router + Google Maps (runs on your machine)
 backend/    Node + Express + TypeScript + Drizzle ORM (runs in Docker)
 shared/     placeholder — shared TS types land here in a later milestone
 ```
@@ -13,6 +13,7 @@ shared/     placeholder — shared TS types land here in a later milestone
 
 - Docker Desktop (for Postgres + backend)
 - Node.js 20+ and npm (for the frontend)
+- A Google Maps Platform API key and Map ID — see [Google Maps setup](#google-maps-setup)
 
 ## Run it
 
@@ -28,9 +29,13 @@ Migrations apply automatically on startup, before the server begins listening.
 
 ```
 cd frontend
+cp .env.example .env     # then paste in your API key and Map ID
 npm install
 npm run dev
 ```
+
+Without those two values the app still runs, but the map and place search are replaced by
+a message naming the variable that is missing.
 
 | What | Where |
 | --- | --- |
@@ -42,7 +47,10 @@ npm run dev
 
 1. Open http://localhost:5173, type a trip name, press **Create trip**.
 2. You land on `/trip/<uuid>` — that URL is the trip. Bookmark or share it.
-3. Add stops, rename, delete, and move them up/down. Refresh; the order persists.
+3. Search for a real place and pick it from the suggestions. It is added as a stop with
+   its real coordinates, address, and place id, and appears as a numbered pin.
+4. Rename, delete, and move stops up/down. Pin numbers follow the list order.
+   Refresh; everything persists.
 
 ## Data model
 
@@ -61,8 +69,8 @@ npm run dev
 | `id` | uuid | PK, `gen_random_uuid()` |
 | `trip_id` | uuid | not null, FK → `trips(id)` **ON DELETE CASCADE** |
 | `name` | text | not null |
-| `address`, `place_id` | text | nullable — **milestone 3** fills these |
-| `latitude`, `longitude` | double precision | nullable — **milestone 3** |
+| `address`, `place_id` | text | nullable; filled from the Places selection |
+| `latitude`, `longitude` | double precision | nullable; filled from the Places selection |
 | `rank` | text | not null; fractional index, order is `ORDER BY rank ASC` |
 | `created_at` / `updated_at` | timestamptz | not null, default `now()` |
 
@@ -100,7 +108,7 @@ All JSON, all prefixed `/api`. `404` for a missing trip/stop, `400` for bad inpu
 | --- | --- | --- | --- |
 | `POST` | `/api/trips` | `{name}` | `201` the trip |
 | `GET` | `/api/trips/:tripId` | — | `{trip, stops}`, stops in `rank ASC` order |
-| `POST` | `/api/trips/:tripId/stops` | `{name}` | `201` the new stop, appended |
+| `POST` | `/api/trips/:tripId/stops` | `{name, address, placeId, lat, lng}` | `201` the new stop, appended |
 | `PATCH` | `/api/stops/:stopId` | `{name}` | the renamed stop |
 | `DELETE` | `/api/stops/:stopId` | — | `204` |
 | `PATCH` | `/api/stops/:stopId/reorder` | `{beforeId, afterId}` | the moved stop |
@@ -125,9 +133,11 @@ own neighbour; `404` if a neighbour belongs to a different trip.
 curl -s -X POST http://localhost:3000/api/trips \
   -H 'Content-Type: application/json' -d '{"name":"Japan 2026"}'
 
-# append a stop  (substitute the trip id from above)
+# append a geocoded stop (substitute the trip id from above)
+# name, lat and lng are required; address and placeId are optional
 curl -s -X POST http://localhost:3000/api/trips/$TRIP/stops \
-  -H 'Content-Type: application/json' -d '{"name":"Tokyo"}'
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Tokyo Tower","address":"4-2-8 Shibakoen, Minato City, Tokyo","placeId":"ChIJCzYy5IuLGGARQ2RaEUdvJGA","lat":35.6585805,"lng":139.7454329}'
 
 # read the trip back, stops already in order
 curl -s http://localhost:3000/api/trips/$TRIP
@@ -143,6 +153,71 @@ curl -s -X PATCH http://localhost:3000/api/stops/$STOP/reorder \
 # delete a stop
 curl -s -X DELETE http://localhost:3000/api/stops/$STOP -o /dev/null -w '%{http_code}\n'
 ```
+
+## Google Maps setup
+
+You need **one API key** and **one Map ID**. The Map ID is not a second key — it is a style
+identifier that `AdvancedMarker` requires.
+
+### In the Google Cloud console
+
+1. Create or pick a project, and make sure **billing is enabled** — Maps will not serve
+   requests without it.
+2. **APIs & Services -> Library**, enable both:
+   - **Maps JavaScript API**
+   - **Places API (New)** — that one specifically, not the legacy "Places API"
+3. **APIs & Services -> Credentials -> Create credentials -> API key**, then **Edit** it:
+   - *Application restrictions* -> **Websites**, add `http://localhost:5173/*`
+   - *API restrictions* -> **Restrict key**, tick **Maps JavaScript API** and
+     **Places API (New)**
+
+   That single key now serves both the map and the search.
+4. **Google Maps Platform -> Map management -> Create Map ID.** Map type **JavaScript**;
+   raster or vector both work, but the ID is mandatory for `AdvancedMarker`.
+
+   For local development you can skip this and set `VITE_GOOGLE_MAPS_MAP_ID=DEMO_MAP_ID`
+   — Google's official testing placeholder, which is what this repo's `.env` uses. Create
+   a real Map ID before deploying anywhere public.
+5. **Billing -> Budgets & alerts**, set a budget, and optionally cap requests per API under
+   *APIs & Services -> Quotas*. Do this before you start clicking around.
+
+### Frontend environment variables
+
+Both live in a gitignored `frontend/.env`; `frontend/.env.example` is the committed template.
+
+| Variable | What it is |
+| --- | --- |
+| `VITE_GOOGLE_MAPS_API_KEY` | The single API key, restricted to both APIs above |
+| `VITE_GOOGLE_MAPS_MAP_ID` | The Map ID, required by `AdvancedMarker` |
+
+**The key is used in the browser.** That is how Maps JavaScript works and is expected — it
+is secured by the referrer and API restrictions from step 3, not by hiding it. Proxying it
+through the backend would not help and is deliberately not done.
+
+Note that Vite only exposes `VITE_`-prefixed variables, and only from its **own**
+directory. A key in `backend/.env` is invisible to the frontend — it has to live in
+`frontend/.env` as `VITE_GOOGLE_MAPS_API_KEY`. The backend makes no Google calls at all in
+this milestone.
+
+### Why `PlaceAutocompleteElement`, not the classic widget
+
+Since **1 March 2025**, `google.maps.places.Autocomplete` and `AutocompleteService` are
+**unavailable to new customers**. This project is new, so they would simply fail. The search
+box uses the current `google.maps.places.PlaceAutocompleteElement` (Places API New) instead.
+The npm wrappers `react-google-places-autocomplete`, `use-places-autocomplete`, and
+`react-google-autocomplete` are all built on the retired APIs and are avoided for the same
+reason.
+
+### Keeping the bill down
+
+- The Maps script loads **exactly once**, from a single `<APIProvider>` wrapping the trip
+  page. The map and the search share that one load and that one key.
+- `PlaceAutocompleteElement` manages its own **session token**: the first `fetchFields()`
+  on a `Place` from `toPlace()` reuses the token from the keystrokes that produced it, so a
+  search plus its detail lookup bills as **one session** instead of per request. Nothing
+  else in the app calls Places.
+- Only three fields are requested — `displayName`, `formattedAddress`, `location`. Fewer
+  fields means a cheaper tier. (`id` is not requestable; it is already on the object.)
 
 ## How it works
 
@@ -189,5 +264,5 @@ data is in a *named* volume and is untouched.
 
 ## Not in this milestone
 
-No realtime/WebSockets, no maps or geocoding, no drag-and-drop, no auth or accounts, and
-`shared/` is still an empty placeholder.
+No routing line between stops (no Directions API), no realtime/WebSockets, no
+drag-and-drop, no auth or accounts, and `shared/` is still an empty placeholder.
