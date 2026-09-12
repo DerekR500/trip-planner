@@ -29,7 +29,10 @@ export type TripDetail = { trip: Trip; stops: Stop[] };
  */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
-    headers: { "Content-Type": "application/json" },
+    // Only declare a JSON content type when there actually is a body. On a bodyless GET or
+    // DELETE it is not a CORS-safelisted header, so sending it anyway forces the browser
+    // into an extra OPTIONS preflight round trip before every read.
+    headers: init?.body ? { "Content-Type": "application/json" } : undefined,
     ...init,
   });
 
@@ -74,3 +77,18 @@ export const reorderStop = (stopId: string, beforeId: string | null, afterId: st
     method: "PATCH",
     body: JSON.stringify({ beforeId, afterId }),
   });
+
+/** Either there is nothing to draw, or a full route. */
+export type RouteResponse =
+  | { route: null }
+  | { encodedPolyline: string; distanceMeters: number; durationSeconds: number };
+
+export type Route = Exclude<RouteResponse, { route: null }>;
+
+export const getRoute = (tripId: string) =>
+  request<RouteResponse>(`/api/trips/${tripId}/route`);
+
+/** Narrows the two-shaped response to "a route I can draw", or null. */
+export function asRoute(response: RouteResponse): Route | null {
+  return "encodedPolyline" in response ? response : null;
+}

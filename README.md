@@ -1,7 +1,8 @@
 # Trip Planner
 
-A collaborative trip planner. Currently at **Milestone 3**: a persistent, single-user trip
-whose stops are real, geocoded places shown on a Google map.
+A collaborative trip planner. Currently at **Milestone 4**: a persistent, single-user trip
+whose stops are real, geocoded places shown on a Google map, connected by the real driving
+route between them.
 
 ```
 frontend/   Vite + React + TS + React Router + Google Maps (runs on your machine)
@@ -51,6 +52,8 @@ a message naming the variable that is missing.
    its real coordinates, address, and place id, and appears as a numbered pin.
 4. Rename, delete, and move stops up/down. Pin numbers follow the list order.
    Refresh; everything persists.
+5. With two or more stops, the map draws the driving route between them in itinerary
+   order and shows total distance and drive time.
 
 ## Data model
 
@@ -112,6 +115,7 @@ All JSON, all prefixed `/api`. `404` for a missing trip/stop, `400` for bad inpu
 | `PATCH` | `/api/stops/:stopId` | `{name}` | the renamed stop |
 | `DELETE` | `/api/stops/:stopId` | — | `204` |
 | `PATCH` | `/api/stops/:stopId/reorder` | `{beforeId, afterId}` | the moved stop |
+| `GET` | `/api/trips/:tripId/route` | — | `{encodedPolyline, distanceMeters, durationSeconds}`, or `{route: null}` |
 
 ### Reorder is neighbour-based
 
@@ -219,6 +223,72 @@ reason.
 - Only three fields are requested — `displayName`, `formattedAddress`, `location`. Fewer
   fields means a cheaper tier. (`id` is not requestable; it is already on the object.)
 
+## Routing
+
+`GET /api/trips/:tripId/route` computes the driving route through the trip's stops in rank
+order and returns:
+
+```json
+{ "encodedPolyline": "ipkcFfich…", "distanceMeters": 615000, "durationSeconds": 21600 }
+```
+
+When there are fewer than two stops with coordinates there is nothing to draw, and it
+returns `{ "route": null }` instead.
+
+The frontend converts the raw numbers for display:
+
+| Raw | Conversion | Shown |
+| --- | --- | --- |
+| `distanceMeters` | `meters / 1609.344`, one decimal | `382.2 mi` |
+| `durationSeconds` | seconds -> minutes, then h + min | `6 h 0 min` |
+
+The `encodedPolyline` is a compressed string of coordinates. The browser expands it with
+the Maps `geometry` library (`decodePath`) and draws a single `google.maps.Polyline`. The
+effect's cleanup removes the previous line before drawing a new one, so routes never stack.
+
+### Why the Routes API, not DirectionsService
+
+`google.maps.DirectionsService`, `DirectionsRenderer`, and `DistanceMatrixService` were
+**deprecated on 25 February 2026**. This project uses the **Routes API**
+(`POST https://routes.googleapis.com/directions/v2:computeRoutes`) instead, called
+**server-side only**.
+
+### Routes API setup
+
+This needs a **second, separate API key** from the frontend one. The frontend key is HTTP
+referrer restricted, and a referrer-restricted key is rejected for server-side calls with
+`API_KEY_HTTP_REFERRER_BLOCKED` — so it cannot be reused here.
+
+1. **APIs & Services -> Library**, enable the **Routes API**.
+2. **Credentials -> Create credentials -> API key.** Then **Edit**:
+   - *Application restrictions* -> **IP addresses** (add your server's IP). For local-only
+     development you may leave it unrestricted, but never do that for a deployed key.
+   - *API restrictions* -> **Restrict key** -> **Routes API** only.
+3. **Billing -> Budgets & alerts**: set a budget, and consider a per-API quota cap under
+   *APIs & Services -> Quotas*. Routing is billed per request.
+4. Put it in `backend/.env`:
+
+   ```
+   GOOGLE_ROUTES_API_KEY=your-routes-api-key-here
+   ```
+
+   `backend/.env` is gitignored; `backend/.env.example` holds the placeholder.
+
+**This key must never reach the browser.** It has no `VITE_` prefix, it is read only in
+`backend/src/services/googleRoutes.ts`, and it is never included in a response body. If it
+is missing the endpoint returns a readable `502` rather than crashing the server.
+
+### Keeping routing costs down
+
+- The `X-Goog-FieldMask` header requests only three fields:
+  `routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration`.
+- The frontend **debounces** route refetches by 500 ms, so a burst of move-up/move-down
+  clicks results in one request, not one per click.
+- Routes are only requested when at least two located stops exist.
+- The backend caches the last result in memory, keyed by the ordered stop ids. Renaming a
+  stop does not change that key, so it does not trigger a recompute; adding, removing, or
+  reordering does.
+
 ## How it works
 
 1. **Browser → backend.** React calls `${VITE_API_URL}/api/...`. The page is on port 5173
@@ -264,5 +334,5 @@ data is in a *named* volume and is untouched.
 
 ## Not in this milestone
 
-No routing line between stops (no Directions API), no realtime/WebSockets, no
-drag-and-drop, no auth or accounts, and `shared/` is still an empty placeholder.
+No realtime/WebSockets, no drag-and-drop, no "Get Directions" handoff to Google Maps, no
+auth or accounts, and `shared/` is still an empty placeholder.

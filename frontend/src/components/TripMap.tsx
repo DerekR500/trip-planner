@@ -1,4 +1,4 @@
-import { AdvancedMarker, Map, Pin, useMap } from '@vis.gl/react-google-maps'
+import { AdvancedMarker, Map, Pin, useMap, useMapsLibrary } from '@vis.gl/react-google-maps'
 import { useEffect, useMemo } from 'react'
 
 import type { Stop } from '../api'
@@ -49,7 +49,40 @@ function FitBounds({ stops }: { stops: LocatedStop[] }) {
   return null
 }
 
-export default function TripMap({ stops }: { stops: Stop[] }) {
+/**
+ * Draws the driving route. The encoded polyline is a compressed string of coordinates;
+ * the Maps `geometry` library expands it back into points.
+ */
+function RoutePolyline({ encodedPolyline }: { encodedPolyline: string | null }) {
+  const map = useMap()
+  const geometry = useMapsLibrary('geometry')
+
+  useEffect(() => {
+    if (!map || !geometry || !encodedPolyline) return
+
+    const line = new google.maps.Polyline({
+      path: geometry.encoding.decodePath(encodedPolyline),
+      strokeColor: '#1a73e8',
+      strokeOpacity: 0.85,
+      strokeWeight: 5,
+    })
+    line.setMap(map)
+
+    // Runs before every re-draw and on unmount, so a stale line can never be left
+    // behind and routes cannot stack on top of each other.
+    return () => line.setMap(null)
+  }, [map, geometry, encodedPolyline])
+
+  return null
+}
+
+export default function TripMap({
+  stops,
+  encodedPolyline,
+}: {
+  stops: Stop[]
+  encodedPolyline: string | null
+}) {
   const located = useMemo(() => stops.filter(hasCoordinates), [stops])
 
   if (!MAP_ID) {
@@ -81,6 +114,7 @@ export default function TripMap({ stops }: { stops: Stop[] }) {
             <Pin glyph={String(index + 1)} />
           </AdvancedMarker>
         ))}
+        <RoutePolyline encodedPolyline={encodedPolyline} />
         <FitBounds stops={located} />
       </Map>
     </div>

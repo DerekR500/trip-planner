@@ -4,15 +4,34 @@ import { Link, useParams } from 'react-router-dom'
 
 import {
   addStop,
+  asRoute,
   deleteStop,
+  getRoute,
   getTrip,
   renameStop,
   reorderStop,
+  type Route,
   type Stop,
   type TripDetail,
 } from '../api'
 import PlaceAutocomplete, { type SelectedPlace } from '../components/PlaceAutocomplete'
 import TripMap from '../components/TripMap'
+
+const ROUTE_DEBOUNCE_MS = 500
+const METERS_PER_MILE = 1609.344
+
+/** 48280 -> "30.0 mi" */
+function formatDistance(meters: number): string {
+  return `${(meters / METERS_PER_MILE).toFixed(1)} mi`
+}
+
+/** 5400 -> "1 h 30 min" */
+function formatDuration(seconds: number): string {
+  const total = Math.round(seconds / 60)
+  const hours = Math.floor(total / 60)
+  const minutes = total % 60
+  return hours > 0 ? `${hours} h ${minutes} min` : `${minutes} min`
+}
 
 // Used in the browser by design — a Maps JS key is public and is secured with HTTP
 // referrer + API restrictions in the Cloud console, not by hiding it behind the backend.
@@ -25,6 +44,8 @@ export default function TripPage() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [mapsError, setMapsError] = useState<string | null>(null)
+  const [route, setRoute] = useState<Route | null>(null)
+  const [routeError, setRouteError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     if (!id) return
@@ -37,6 +58,37 @@ export default function TripPage() {
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false))
   }, [refresh])
+
+  // The ordered stop ids are the only thing the route depends on. Renaming a stop leaves
+  // this string untouched, so it does not trigger a recompute; add/remove/reorder all do.
+  const stopSignature = data?.stops.map((s) => s.id).join(',') ?? ''
+  const stopCount = data?.stops.length ?? 0
+
+  useEffect(() => {
+    if (!id) return
+
+    if (stopCount < 2) {
+      setRoute(null)
+      setRouteError(null)
+      return
+    }
+
+    // Debounce: clearTimeout on each change collapses a burst of fast move-up/move-down
+    // clicks into a single Routes API call once things go quiet.
+    const timer = setTimeout(() => {
+      getRoute(id)
+        .then((response) => {
+          setRoute(asRoute(response))
+          setRouteError(null)
+        })
+        .catch((err: unknown) => {
+          setRoute(null)
+          setRouteError(err instanceof Error ? err.message : String(err))
+        })
+    }, ROUTE_DEBOUNCE_MS)
+
+    return () => clearTimeout(timer)
+  }, [id, stopSignature, stopCount])
 
   /** Every mutation: run it, re-fetch so the order is the server's, surface failures. */
   const run = useCallback(
@@ -121,7 +173,19 @@ export default function TripPage() {
             setMapsError('Google Maps failed to load. Check the API key and its restrictions.')
           }
         >
-          {mapsError ? <p role="alert">{mapsError}</p> : <TripMap stops={stops} />}
+          {mapsError ? (
+            <p role="alert">{mapsError}</p>
+          ) : (
+            <TripMap stops={stops} encodedPolyline={route?.encodedPolyline ?? null} />
+          )}
+
+          {route && (
+            <p>
+              Driving route: <strong>{formatDistance(route.distanceMeters)}</strong> ·{' '}
+              <strong>{formatDuration(route.durationSeconds)}</strong>
+            </p>
+          )}
+          {routeError && <p role="alert">Could not compute the route — {routeError}</p>}
 
           <h2>Add a stop</h2>
           <PlaceAutocomplete onSelect={handleSelectPlace} disabled={busy} />
