@@ -17,7 +17,10 @@ services:
       retries: 10
 
   backend:
-    build: ./backend
+    build:
+      # Root context so the image can include shared/ alongside backend/.
+      context: .
+      dockerfile: backend/Dockerfile
     depends_on:
       postgres:
         # Wait until Postgres actually accepts connections, not just until it starts.
@@ -31,11 +34,13 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      # Bind-mount source for hot reload...
-      - ./backend:/app
+      # Bind-mount source for hot reload. Both trees are mounted so the relative import
+      # ../../shared from backend/src resolves identically here and on the host.
+      - ./backend:/app/backend
+      - ./shared:/app/shared
       # ...but keep the container's own node_modules (built for Linux) from being
       # shadowed by the host's.
-      - /app/node_modules
+      - /app/backend/node_modules
 
 volumes:
   postgres-data:

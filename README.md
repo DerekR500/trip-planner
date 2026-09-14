@@ -1,13 +1,13 @@
 # Trip Planner
 
-A collaborative trip planner. Currently at **Milestone 4**: a persistent, single-user trip
-whose stops are real, geocoded places shown on a Google map, connected by the real driving
-route between them.
+A collaborative trip planner. Currently at **Milestone 5**: several people open the same
+trip URL and edit it together live over WebSockets, with geocoded stops on a Google map and
+the real driving route between them.
 
 ```
 frontend/   Vite + React + TS + React Router + Google Maps (runs on your machine)
-backend/    Node + Express + TypeScript + Drizzle ORM (runs in Docker)
-shared/     placeholder — shared TS types land here in a later milestone
+backend/    Node + Express + TypeScript + Drizzle + ws (runs in Docker)
+shared/     the WebSocket protocol types, imported by BOTH sides
 ```
 
 ## Prerequisites
@@ -54,6 +54,8 @@ a message naming the variable that is missing.
    Refresh; everything persists.
 5. With two or more stops, the map draws the driving route between them in itinerary
    order and shows total distance and drive time.
+6. Send the URL to someone else. They pick their own name, and from then on every add,
+   rename, delete, and reorder shows up on both screens live — no refresh.
 
 ## Data model
 
@@ -111,11 +113,10 @@ All JSON, all prefixed `/api`. `404` for a missing trip/stop, `400` for bad inpu
 | --- | --- | --- | --- |
 | `POST` | `/api/trips` | `{name}` | `201` the trip |
 | `GET` | `/api/trips/:tripId` | — | `{trip, stops}`, stops in `rank ASC` order |
-| `POST` | `/api/trips/:tripId/stops` | `{name, address, placeId, lat, lng}` | `201` the new stop, appended |
-| `PATCH` | `/api/stops/:stopId` | `{name}` | the renamed stop |
-| `DELETE` | `/api/stops/:stopId` | — | `204` |
-| `PATCH` | `/api/stops/:stopId/reorder` | `{beforeId, afterId}` | the moved stop |
 | `GET` | `/api/trips/:tripId/route` | — | `{encodedPolyline, distanceMeters, durationSeconds}`, or `{route: null}` |
+
+Stop mutations are **no longer HTTP**. Adding, renaming, deleting, and reordering all travel
+over the WebSocket (see below); the REST endpoints for them were removed in milestone 5.
 
 ### Reorder is neighbour-based
 
@@ -137,25 +138,13 @@ own neighbour; `404` if a neighbour belongs to a different trip.
 curl -s -X POST http://localhost:3000/api/trips \
   -H 'Content-Type: application/json' -d '{"name":"Japan 2026"}'
 
-# append a geocoded stop (substitute the trip id from above)
-# name, lat and lng are required; address and placeId are optional
-curl -s -X POST http://localhost:3000/api/trips/$TRIP/stops \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Tokyo Tower","address":"4-2-8 Shibakoen, Minato City, Tokyo","placeId":"ChIJCzYy5IuLGGARQ2RaEUdvJGA","lat":35.6585805,"lng":139.7454329}'
-
 # read the trip back, stops already in order
 curl -s http://localhost:3000/api/trips/$TRIP
 
-# rename a stop
-curl -s -X PATCH http://localhost:3000/api/stops/$STOP \
-  -H 'Content-Type: application/json' -d '{"name":"Tokyo (3 nights)"}'
+# the computed driving route
+curl -s http://localhost:3000/api/trips/$TRIP/route
 
-# move $STOP to the very top: nothing above it, $FIRST below it
-curl -s -X PATCH http://localhost:3000/api/stops/$STOP/reorder \
-  -H 'Content-Type: application/json' -d '{"beforeId":null,"afterId":"'$FIRST'"}'
-
-# delete a stop
-curl -s -X DELETE http://localhost:3000/api/stops/$STOP -o /dev/null -w '%{http_code}\n'
+# stop mutations are websocket-only now - see the Realtime collaboration section
 ```
 
 ## Google Maps setup
@@ -222,6 +211,82 @@ reason.
   else in the app calls Places.
 - Only three fields are requested — `displayName`, `formattedAddress`, `location`. Fewer
   fields means a cheaper tier. (`id` is not requestable; it is already on the object.)
+
+## Realtime collaboration
+
+Everything that changes a stop travels over a WebSocket. The server is **authoritative**: a
+click sends an *intent*, the server validates it, writes to Postgres, and broadcasts the
+result to everyone in the room - including whoever clicked. There is no optimistic UI in this
+milestone, so a small round trip of lag is expected and normal.
+
+### One shared protocol, two consumers
+
+[shared/protocol.ts](shared/protocol.ts) defines two discriminated unions - `ClientMessage`
+and `ServerMessage` - plus the `Trip` and `Stop` wire shapes. **Both** the browser and the
+server import that one file, so the wire is typed identically at both ends and a change to a
+message shape becomes a compile error on whichever side stops agreeing.
+
+Because `shared/` sits outside `backend/`, three things make it resolvable:
+
+- `backend/tsconfig.json` sets `rootDir: ".."` and includes `../shared/**/*.ts`
+- `frontend/vite.config.ts` sets `server.fs.allow: ['..']` (Vite refuses to serve files above
+  its own root by default), and `tsconfig.app.json` includes `../shared`
+- the Docker build context is the **repo root**, and `docker-compose.yml` mounts both
+  `./backend` and `./shared` under `/app`, so `../../shared` resolves the same inside the
+  container as it does on your machine
+
+### Messages
+
+| Client -> server | Meaning |
+| --- | --- |
+| `presence:hello` | join a trip's room under a display name |
+| `stop:add` | append a geocoded stop |
+| `stop:remove` / `stop:rename` | delete / rename |
+| `stop:reorder` | neighbour-based move (`beforeId`, `afterId`) |
+
+| Server -> client | Meaning |
+| --- | --- |
+| `trip:state` | full snapshot: trip, stops in rank order, who is here |
+| `stop:added` / `stop:removed` / `stop:renamed` / `stop:reordered` | one authoritative change |
+| `presence:update` | the room roster changed |
+| `error` | sent to the offending client **only**, never broadcast |
+
+### Rooms
+
+The server keeps `Map<tripId, Set<Connection>>` - one room per trip. A broadcast walks only
+that trip's set, so two trips never see each other's traffic. Rooms are deleted when their
+last member leaves, so the map cannot grow without bound.
+
+Every message except `presence:hello` must carry the `tripId` that connection actually
+joined; a mismatch is rejected. That stops a client from mutating a trip it never joined.
+
+### Presence and heartbeat
+
+Closing a tab sends a WebSocket close frame, and the `close` handler removes the connection
+and re-broadcasts the roster. But a socket that dies *without* a close frame - a dropped
+network, a sleeping laptop - would otherwise linger as a ghost member forever.
+
+So the server pings every connection every 30 seconds. Each tick marks every connection
+`isAlive = false` before pinging; an arriving pong flips it back to `true`. Anything still
+`false` on the next tick never answered and gets terminated, which fires `close` and cleans
+up its room. Worst case, a ghost lingers for two ticks.
+
+### Reconnection
+
+The browser's `WebSocket` does **not** reconnect on its own - once it closes it stays closed.
+[useTripSocket.ts](frontend/src/hooks/useTripSocket.ts) reconnects with exponential backoff
+(0.5s, doubling, capped at 10s) and re-sends `presence:hello` every time. The server answers
+with a fresh `trip:state`, which resyncs anything missed while disconnected - that snapshot
+is what makes a reconnect *correct* rather than merely *connected*.
+
+`VITE_WS_URL` (default `ws://localhost:3000`) points at it. The WebSocket shares Express's
+port because the HTTP server is created explicitly and handed to
+`new WebSocketServer({ server })`, so no extra port is published.
+
+### Display names
+
+A name is stored per trip in `localStorage`, so a refresh rejoins under the same identity.
+**This is not authentication** - anyone with the URL can join and type any name they like.
 
 ## Routing
 
@@ -334,5 +399,6 @@ data is in a *named* volume and is untouched.
 
 ## Not in this milestone
 
-No realtime/WebSockets, no drag-and-drop, no "Get Directions" handoff to Google Maps, no
-auth or accounts, and `shared/` is still an empty placeholder.
+No drag-and-drop (move-up/move-down buttons only), no optimistic UI - your own edits apply
+when the server echoes them back - no "Get Directions" handoff to Google Maps, no auth or
+accounts, and no deployment.

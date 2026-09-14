@@ -3,14 +3,19 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "nodenext",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": "..",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "sourceMap": true
   },
-  "include": ["src"]
+  "include": [
+    "src",
+    "../shared/**/*.ts"
+  ]
 }
