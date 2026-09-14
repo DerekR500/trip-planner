@@ -51,7 +51,15 @@ export function asRoute(response: RouteResponse): Route | null {
   return 'encodedPolyline' in response ? response : null
 }
 
-/** Stops must always be displayed in rank order, never arrival order. */
-export function sortByRank(stops: Stop[]): Stop[] {
-  return [...stops].sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0))
+/**
+ * The canonical display order, matching the server's ORDER BY (rank, id).
+ *
+ * The id tie-break is what guarantees convergence: if two stops ever share a rank,
+ * sorting by rank alone would let two clients render them in different orders forever.
+ */
+export function sortStops(stops: Stop[]): Stop[] {
+  return [...stops].sort((a, b) => {
+    if (a.rank !== b.rank) return a.rank < b.rank ? -1 : 1
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+  })
 }

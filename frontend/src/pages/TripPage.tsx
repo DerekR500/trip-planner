@@ -1,10 +1,26 @@
+import {
+  closestCenter,
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core'
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
 import { APIProvider } from '@vis.gl/react-google-maps'
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 import type { ServerMessage, Stop, Trip } from '../../../shared/protocol'
-import { asRoute, getRoute, getTrip, sortByRank, type Route } from '../api'
+import { asRoute, getRoute, getTrip, sortStops, type Route } from '../api'
 import PlaceAutocomplete, { type SelectedPlace } from '../components/PlaceAutocomplete'
+import SortableStop from '../components/SortableStop'
 import TripMap from '../components/TripMap'
 import { useTripSocket } from '../hooks/useTripSocket'
 
@@ -31,6 +47,38 @@ const nameKey = (tripId: string) => `tripDisplayName:${tripId}`
 // referrer + API restrictions in the Cloud console, not by hiding it behind the backend.
 const MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined
 
+/**
+ * The local user's in-flight drags.
+ *
+ * `order` is the id sequence they should SEE right now; `pending` is the set of opIds we
+ * are still waiting on. The overlay is dropped only once every pending op has been
+ * answered — confirmed or rejected — at which point the authoritative list governs again.
+ */
+type LocalMoves = { order: string[] | null; pending: string[] }
+
+const NO_MOVES: LocalMoves = { order: null, pending: [] }
+
+/**
+ * Lays the local user's predicted order over the server's list.
+ *
+ * Stops the overlay does not mention (added by someone else mid-drag) keep their
+ * authoritative place at the end; stops that vanished (deleted by someone else mid-drag)
+ * simply drop out. That is what stops a remote edit from breaking a local drag.
+ */
+function applyOverlay(authoritative: Stop[], order: string[]): Stop[] {
+  const remaining = new Map(authoritative.map((s) => [s.id, s]))
+  const result: Stop[] = []
+  for (const id of order) {
+    const stop = remaining.get(id)
+    if (stop) {
+      result.push(stop)
+      remaining.delete(id)
+    }
+  }
+  for (const stop of authoritative) if (remaining.has(stop.id)) result.push(stop)
+  return result
+}
+
 export default function TripPage() {
   const { id } = useParams<{ id: string }>()
 
@@ -40,7 +88,9 @@ export default function TripPage() {
   const [nameDraft, setNameDraft] = useState('')
 
   const [trip, setTrip] = useState<Trip | null>(null)
-  const [stops, setStops] = useState<Stop[]>([])
+  /** The server's truth. Updated by every broadcast, including other people's, always. */
+  const [authoritative, setAuthoritative] = useState<Stop[]>([])
+  const [local, setLocal] = useState<LocalMoves>(NO_MOVES)
   const [users, setUsers] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -55,55 +105,78 @@ export default function TripPage() {
     getTrip(id)
       .then((detail) => {
         setTrip(detail.trip)
-        setStops(sortByRank(detail.stops))
+        setAuthoritative(sortStops(detail.stops))
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false))
   }, [id])
 
   /**
-   * The server is authoritative: nothing here is applied optimistically. A click sends an
-   * intent, and state only changes when the broadcast comes back — which is also why other
-   * people's edits arrive through this exact same path.
+   * Server messages only ever touch the authoritative layer. The optimistic overlay is
+   * cleared by opId correlation, never by guessing from the content of a broadcast.
    */
   const handleMessage = useCallback((message: ServerMessage) => {
+    /** Drop one answered op; when none are left the overlay goes with it. */
+    const settle = (opId?: string) => {
+      if (!opId) return
+      setLocal((prev) => {
+        if (!prev.pending.includes(opId)) return prev
+        const pending = prev.pending.filter((x) => x !== opId)
+        return pending.length > 0 ? { order: prev.order, pending } : NO_MOVES
+      })
+    }
+
     switch (message.type) {
       case 'trip:state':
         setTrip(message.trip)
-        setStops(sortByRank(message.stops))
+        setAuthoritative(sortStops(message.stops))
         setUsers(message.users)
+        // A fresh snapshot (first join or a reconnect) supersedes any local guess.
+        setLocal(NO_MOVES)
         setError(null)
         break
       case 'stop:added':
-        setStops((prev) => sortByRank([...prev, message.stop]))
+        setAuthoritative((prev) => sortStops([...prev, message.stop]))
         break
       case 'stop:removed':
-        setStops((prev) => prev.filter((s) => s.id !== message.stopId))
+        setAuthoritative((prev) => prev.filter((s) => s.id !== message.stopId))
         break
       case 'stop:renamed':
-        setStops((prev) => prev.map((s) => (s.id === message.stop.id ? message.stop : s)))
+        setAuthoritative((prev) => prev.map((s) => (s.id === message.stop.id ? message.stop : s)))
         break
       case 'stop:reordered':
-        // Only the moved stop's rank changed; re-sorting is what reveals the new order.
-        setStops((prev) =>
-          sortByRank(prev.map((s) => (s.id === message.stop.id ? message.stop : s))),
+        setAuthoritative((prev) =>
+          sortStops(prev.map((s) => (s.id === message.stop.id ? message.stop : s))),
         )
+        // Ours: stop predicting. Someone else's: no opId match, overlay untouched.
+        settle(message.opId)
         break
       case 'presence:update':
         setUsers(message.users)
         break
       case 'error':
         setError(message.message)
+        // A rejected drag rolls back: the overlay is dropped and the list snaps to truth.
+        settle(message.opId)
         break
     }
   }, [])
 
   const { status, send } = useTripSocket(id, displayName, handleMessage)
 
-  // The route depends only on which stops exist and in what order. Renaming leaves this
-  // string untouched, so it costs nothing; add/remove/reorder all change it.
-  const stopSignature = stops.map((s) => s.id).join(',')
-  const stopCount = stops.length
+  /** What the user actually sees: truth, with their own in-flight prediction on top. */
+  const displayed = useMemo(
+    () =>
+      local.order && local.pending.length > 0
+        ? applyOverlay(authoritative, local.order)
+        : authoritative,
+    [authoritative, local],
+  )
+
+  // Deliberately keyed on AUTHORITATIVE order, not the displayed one: an optimistic frame
+  // must not trigger a billable Routes API call. The route settles once the server agrees.
+  const authoritativeSignature = authoritative.map((s) => s.id).join(',')
+  const stopCount = authoritative.length
 
   useEffect(() => {
     if (!id) return
@@ -124,9 +197,40 @@ export default function TripPage() {
         })
     }, ROUTE_DEBOUNCE_MS)
     return () => clearTimeout(timer)
-  }, [id, stopSignature, stopCount])
+  }, [id, authoritativeSignature, stopCount])
 
   /* -------------------------------------------------- intents sent over the websocket */
+
+  const sensors = useSensors(
+    useSensor(PointerSensor),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  )
+
+  function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event
+    if (!over || active.id === over.id || !id) return
+
+    const from = displayed.findIndex((s) => s.id === active.id)
+    const to = displayed.findIndex((s) => s.id === over.id)
+    if (from === -1 || to === -1) return
+
+    // 1. Predict: redraw immediately so the drag feels instant.
+    const next = arrayMove(displayed, from, to)
+    const opId = crypto.randomUUID()
+    setLocal((prev) => ({ order: next.map((s) => s.id), pending: [...prev.pending, opId] }))
+
+    // 2. Send the intent, described by neighbours rather than an index, so the server can
+    //    still place it sensibly if the list moved under us in the meantime.
+    send({
+      type: 'stop:reorder',
+      tripId: id,
+      stopId: String(active.id),
+      beforeId: next[to - 1]?.id ?? null,
+      afterId: next[to + 1]?.id ?? null,
+      opId,
+    })
+    // 3. Reconcile happens in handleMessage, keyed on that opId.
+  }
 
   const handleSelectPlace = useCallback(
     (place: SelectedPlace) => {
@@ -152,28 +256,9 @@ export default function TripPage() {
     send({ type: 'stop:rename', tripId: id, stopId, name: trimmed })
   }
 
-  // Moving up means landing between the stop two above and the stop directly above.
-  // A missing neighbour is null, which the server reads as "the end of the list".
-  function handleMoveUp(list: Stop[], index: number) {
+  function handleDelete(stopId: string) {
     if (!id) return
-    send({
-      type: 'stop:reorder',
-      tripId: id,
-      stopId: list[index].id,
-      beforeId: list[index - 2]?.id ?? null,
-      afterId: list[index - 1].id,
-    })
-  }
-
-  function handleMoveDown(list: Stop[], index: number) {
-    if (!id) return
-    send({
-      type: 'stop:reorder',
-      tripId: id,
-      stopId: list[index].id,
-      beforeId: list[index + 1].id,
-      afterId: list[index + 2]?.id ?? null,
-    })
+    send({ type: 'stop:remove', tripId: id, stopId })
   }
 
   /* ------------------------------------------------------------------------ rendering */
@@ -236,6 +321,7 @@ export default function TripPage() {
         {' · '}
         <strong>{users.length}</strong> here: {users.join(', ') || '—'}
         {' · '}you are <strong>{displayName}</strong>
+        {local.pending.length > 0 && ' · saving…'}
       </p>
 
       {error && <p role="alert">Something went wrong — {error}</p>}
@@ -253,7 +339,7 @@ export default function TripPage() {
           {mapsError ? (
             <p role="alert">{mapsError}</p>
           ) : (
-            <TripMap stops={stops} encodedPolyline={route?.encodedPolyline ?? null} />
+            <TripMap stops={displayed} encodedPolyline={route?.encodedPolyline ?? null} />
           )}
 
           {route && (
@@ -275,32 +361,31 @@ export default function TripPage() {
       )}
 
       <h2>Stops</h2>
-      {stops.length === 0 ? (
+      {displayed.length === 0 ? (
         <p>No stops yet. Search for a place above.</p>
       ) : (
-        <ol>
-          {stops.map((stop, index) => (
-            <li key={stop.id}>
-              {stop.name}
-              {stop.address && <span> — {stop.address}</span>}{' '}
-              <button onClick={() => handleMoveUp(stops, index)} disabled={index === 0}>
-                ↑
-              </button>
-              <button
-                onClick={() => handleMoveDown(stops, index)}
-                disabled={index === stops.length - 1}
-              >
-                ↓
-              </button>
-              <button onClick={() => handleRename(stop.id, stop.name)}>Rename</button>
-              <button
-                onClick={() => id && send({ type: 'stop:remove', tripId: id, stopId: stop.id })}
-              >
-                Delete
-              </button>
-            </li>
-          ))}
-        </ol>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={displayed.map((s) => s.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            <ol style={{ paddingLeft: 0 }}>
+              {displayed.map((stop, index) => (
+                <SortableStop
+                  key={stop.id}
+                  stop={stop}
+                  position={index + 1}
+                  onRename={handleRename}
+                  onDelete={handleDelete}
+                />
+              ))}
+            </ol>
+          </SortableContext>
+        </DndContext>
       )}
 
       <p>

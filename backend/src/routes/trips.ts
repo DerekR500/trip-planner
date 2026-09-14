@@ -43,7 +43,7 @@ tripsRouter.get("/:tripId", async (req, res) => {
     .select()
     .from(stops)
     .where(eq(stops.tripId, tripId))
-    .orderBy(asc(stops.rank));
+    .orderBy(asc(stops.rank), asc(stops.id));
 
   res.json({ trip, stops: tripStops });
 });
@@ -93,7 +93,7 @@ tripsRouter.get("/:tripId/route", async (req, res) => {
     .where(
       and(eq(stops.tripId, tripId), isNotNull(stops.latitude), isNotNull(stops.longitude)),
     )
-    .orderBy(asc(stops.rank));
+    .orderBy(asc(stops.rank), asc(stops.id));
 
   if (located.length < 2) {
     res.json({ route: null });

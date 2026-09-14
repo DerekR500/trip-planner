@@ -1,8 +1,8 @@
 # Trip Planner
 
-A collaborative trip planner. Currently at **Milestone 5**: several people open the same
-trip URL and edit it together live over WebSockets, with geocoded stops on a Google map and
-the real driving route between them.
+A collaborative trip planner. Currently at **Milestone 6**: several people open the same
+trip URL and edit it together live over WebSockets, dragging stops into order with instant
+feedback, on a Google map showing the real driving route between them.
 
 ```
 frontend/   Vite + React + TS + React Router + Google Maps (runs on your machine)
@@ -56,6 +56,9 @@ a message naming the variable that is missing.
    order and shows total distance and drive time.
 6. Send the URL to someone else. They pick their own name, and from then on every add,
    rename, delete, and reorder shows up on both screens live — no refresh.
+7. Drag a stop by its handle to reorder it. It moves instantly for you and appears on
+   everyone else's screen a moment later. Keyboard works too: tab to a handle, press
+   space, arrow up/down, space to drop.
 
 ## Data model
 
@@ -242,7 +245,7 @@ Because `shared/` sits outside `backend/`, three things make it resolvable:
 | `presence:hello` | join a trip's room under a display name |
 | `stop:add` | append a geocoded stop |
 | `stop:remove` / `stop:rename` | delete / rename |
-| `stop:reorder` | neighbour-based move (`beforeId`, `afterId`) |
+| `stop:reorder` | neighbour-based move (`beforeId`, `afterId`, `opId`) |
 
 | Server -> client | Meaning |
 | --- | --- |
@@ -287,6 +290,113 @@ port because the HTTP server is created explicitly and handed to
 
 A name is stored per trip in `localStorage`, so a refresh rejoins under the same identity.
 **This is not authentication** - anyone with the URL can join and type any name they like.
+
+## Reordering, optimism, and concurrency
+
+Dragging is the one interaction that must feel instant, so it is the one place with
+optimistic UI. Everything else (add, rename, delete) still waits for the server.
+
+### Two layers of state
+
+The trip page keeps them apart on purpose:
+
+- **authoritative** — the last thing the server said. Every broadcast updates it, including
+  other people's edits, at all times, even mid-drag.
+- **optimistic overlay** — only the local user's own in-flight drags, keyed by `opId`.
+
+What you see is authoritative sorted by `(rank, id)`, with your overlay laid on top. With
+nothing in flight, the overlay is empty and you are looking at pure server truth.
+
+### The flow: predict, send, reconcile
+
+1. **Predict.** On drop, the list is reordered locally with `arrayMove` and drawn
+   immediately. No waiting.
+2. **Send.** A fresh `opId` (`crypto.randomUUID()`) is recorded as pending, and a
+   `stop:reorder` goes out describing the destination as **neighbours** (`beforeId`,
+   `afterId`) rather than an index — an index would be meaningless by the time it arrives if
+   the list changed.
+3. **Reconcile.** The server echoes the `opId` back on `stop:reordered`. The originator
+   matches it, drops that pending entry, and once nothing is pending the overlay is
+   discarded and authoritative governs again. Everyone else sees no matching `opId` and
+   simply applies the new rank.
+4. **Roll back.** If the server answers `error` with that `opId`, the overlay is dropped
+   the same way and the list snaps back to truth.
+
+A `trip:state` snapshot (first join or a reconnect) always clears the overlay outright — a
+full snapshot outranks any local guess.
+
+### Per-trip serialization
+
+All mutations for one trip run strictly one at a time, chained on a promise in
+[ws/queue.ts](backend/src/ws/queue.ts).
+
+This is what makes concurrent drags safe. A reorder reads the stop list, picks a rank
+between two neighbours, and writes it. If two of those interleaved, both could read the same
+"before" state and mint the **same key between the same pair** — a rank tie. Serializing
+means the second reorder always sees the first one's committed row.
+
+`presence:hello` goes through the same queue, so the snapshot a joiner receives is taken
+atomically with joining the room — otherwise a mutation could commit in the gap and the
+joiner would either miss it or overwrite it with a stale snapshot.
+
+### Neighbour-resolution fallback
+
+By the time a drag reaches the server, the neighbours it named may have been moved or
+deleted by someone else. Rather than fail a perfectly reasonable drag, the server resolves
+to the nearest sensible slot:
+
+| Situation | Result |
+| --- | --- |
+| `beforeId` still exists | sit directly after it |
+| `beforeId` is explicitly `null` | top of the list |
+| `beforeId` is gone, `afterId` survives | sit directly before `afterId` |
+| both gone | append to the end |
+| the **dragged stop itself** is gone | `error` with the `opId`; sender rolls back |
+
+Both surrounding ranks are then read out of one sorted array, so they are adjacent and
+ascending by construction — an inverted pair is impossible.
+
+### Ordering is always `(rank, id)`
+
+Every ordered read — the `trip:state` snapshot, the initial HTTP load, the route
+computation — sorts by rank **and then id**, and so does every client. If two stops ever
+did end up sharing a rank, sorting by rank alone would leave the tie to the database and two
+clients could render them differently forever. The id tie-break makes any tie resolve
+identically everywhere.
+
+### How each concurrency case resolves
+
+| Case | Outcome |
+| --- | --- |
+| Two people drag **different** stops at once | Both survive. Each writes one row and never touches its neighbours, so the moves compose; everyone converges. |
+| Two people drag the **same** stop at once | Last write wins by server receive order. The loser's optimistic guess reconciles to the winner when the broadcast arrives. No duplicates, no divergence, no jitter. |
+| A **neighbour** is moved or deleted mid-flight | The fallback above picks the nearest slot; the drag still lands somewhere sensible and everyone converges. |
+| The **dragged stop** is deleted mid-flight | The sender gets `error` with its `opId` and rolls back. The stop is simply gone for everyone. No crash. |
+| Reconnect or refresh | `trip:state` resyncs to authoritative `(rank, id)` order and clears any overlay. |
+
+### Known limitations (deliberate, not bugs)
+
+**Same-stop conflicts are last-write-wins, not merged.** If two people drag the same stop
+at the same moment, one intent is simply overwritten. A CRDT (or OT) would let both
+intentions contribute to a merged result, and would also allow offline edits to converge
+later without a server. That is a large amount of machinery — per-element causal metadata,
+tombstones, a merge function to get right — for a product where two people rarely grab the
+same stop in the same second, and where the outcome here is still *convergent and
+predictable*: everyone ends up in the same order, immediately. LWW is the right v1 trade;
+the neighbour-based single-row contract is what would let a CRDT slot in later without
+rewriting the wire protocol.
+
+**Fractional-index keys grow slowly.** Repeatedly dropping a stop between the same two
+neighbours lengthens the key each time (`a0`, `a0V`, `a0Fk`, …). There is no rebalancing
+pass. In practice keys stay tiny — a 12-reorder stress test across three clients produced a
+maximum key length of 3 — and a rebalance could be added later as a background job.
+
+**Per-trip mutations are processed one at a time.** That is correctness bought with
+throughput. Different trips never block each other, and a single mutation is a couple of
+indexed queries, so at this scale the queue is never the bottleneck. A busier system would
+want per-trip row locking in Postgres instead of an in-process queue — which also becomes
+necessary the moment the backend runs as more than one instance, since this queue is
+in-memory and per-process.
 
 ## Routing
 
@@ -399,6 +509,6 @@ data is in a *named* volume and is untouched.
 
 ## Not in this milestone
 
-No drag-and-drop (move-up/move-down buttons only), no optimistic UI - your own edits apply
-when the server echoes them back - no "Get Directions" handoff to Google Maps, no auth or
-accounts, and no deployment.
+No CRDT or operational transform (same-stop conflicts are last-write-wins), no optimistic
+UI for add/rename/delete — only reorder is optimistic — no "Get Directions" handoff to
+Google Maps, no auth or accounts, and no deployment.

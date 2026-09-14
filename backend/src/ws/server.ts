@@ -11,6 +11,7 @@ import {
   reorderStop,
   StopServiceError,
 } from "../services/stops.js";
+import { enqueue } from "./queue.js";
 import { broadcast, join, leave, send, usersIn, type Connection } from "./rooms.js";
 
 /** How often to ping. A socket that hasn't ponged by the next tick is terminated. */
@@ -56,51 +57,62 @@ async function handleMessage(connection: Connection, message: ClientMessage): Pr
         return;
       }
 
-      const state = await loadTripState(message.tripId);
-      if (!state) {
-        send(connection.socket, { type: "error", message: "Trip not found." });
-        return;
-      }
+      // Queued alongside mutations so the snapshot is taken atomically with joining the
+      // room. Otherwise a mutation could commit and broadcast in the gap between reading
+      // the snapshot and joining, and the joiner would either miss it or overwrite it
+      // with a stale trip:state.
+      await enqueue(message.tripId, async () => {
+        const state = await loadTripState(message.tripId);
+        if (!state) {
+          send(connection.socket, { type: "error", message: "Trip not found." });
+          return;
+        }
 
-      join(connection, message.tripId, name);
+        join(connection, message.tripId, name);
 
-      // The joiner gets the full snapshot; everyone (including them) gets the new roster.
-      send(connection.socket, {
-        type: "trip:state",
-        trip: state.trip,
-        stops: state.stops,
-        users: usersIn(message.tripId),
+        // The joiner gets the full snapshot; everyone (including them) gets the roster.
+        send(connection.socket, {
+          type: "trip:state",
+          trip: state.trip,
+          stops: state.stops,
+          users: usersIn(message.tripId),
+        });
+        broadcast(message.tripId, { type: "presence:update", users: usersIn(message.tripId) });
       });
-      broadcast(message.tripId, { type: "presence:update", users: usersIn(message.tripId) });
       return;
     }
 
     case "stop:add": {
-      const stop = await addStop(message);
+      const stop = await enqueue(message.tripId, () => addStop(message));
       broadcast(message.tripId, { type: "stop:added", stop });
       return;
     }
 
     case "stop:remove": {
-      const stopId = await removeStop(message.tripId, message.stopId);
+      const stopId = await enqueue(message.tripId, () =>
+        removeStop(message.tripId, message.stopId),
+      );
       broadcast(message.tripId, { type: "stop:removed", stopId });
       return;
     }
 
     case "stop:rename": {
-      const stop = await renameStop(message.tripId, message.stopId, message.name);
+      const stop = await enqueue(message.tripId, () =>
+        renameStop(message.tripId, message.stopId, message.name),
+      );
       broadcast(message.tripId, { type: "stop:renamed", stop });
       return;
     }
 
     case "stop:reorder": {
-      const stop = await reorderStop(
-        message.tripId,
-        message.stopId,
-        message.beforeId,
-        message.afterId,
+      // Serialized: the rank is computed against committed state, so two simultaneous
+      // drags can never mint the same key between the same pair of neighbours.
+      const stop = await enqueue(message.tripId, () =>
+        reorderStop(message.tripId, message.stopId, message.beforeId, message.afterId),
       );
-      broadcast(message.tripId, { type: "stop:reordered", stop });
+      // opId goes to the whole room, but only the originator recognises it and clears
+      // its optimistic overlay; everyone else just applies the new rank.
+      broadcast(message.tripId, { type: "stop:reordered", stop, opId: message.opId });
       return;
     }
   }
@@ -134,14 +146,18 @@ export function attachWebSocketServer(server: Server): WebSocketServer {
         return;
       }
 
+      // Echoed back on failure so a client whose optimistic drag was rejected knows
+      // exactly which move to roll back.
+      const opId = message.type === "stop:reorder" ? message.opId : undefined;
+
       void handleMessage(connection, message).catch((err: unknown) => {
         if (err instanceof StopServiceError) {
           // Expected, user-facing: tell only the sender, leave the room alone.
-          send(socket, { type: "error", message: err.message });
+          send(socket, { type: "error", message: err.message, opId });
           return;
         }
         console.error("WebSocket handler failed:", err);
-        send(socket, { type: "error", message: "Internal server error." });
+        send(socket, { type: "error", message: "Internal server error.", opId });
       });
     });
 
